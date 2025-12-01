@@ -92,7 +92,10 @@
     <div class="max-w-md mx-auto">
         <header class="mb-6">
             <h1 class="text-3xl font-extrabold text-gray-900 mb-2">Attendance Check</h1>
-            <p class="text-gray-600">Upload your roster (Excel file) and mark attendance by tapping. <span class="text-xs text-gray-400">v1.2.1</span></p>
+            <p class="text-gray-600">Upload your roster (Excel file) and mark attendance by tapping. <span class="text-xs text-gray-400">v1.3.0 (Persistent)</span></p>
+            <p class="text-xs text-red-600 mt-1 p-2 bg-red-100 rounded-lg">
+                Note: If selecting from Google Drive fails, please download the file to your device's local storage first, then select it from there.
+            </p>
         </header>
 
         <!-- File Input Area -->
@@ -133,6 +136,7 @@
         const FILE_STATUS = document.getElementById('file-status');
         const PLACEHOLDER = document.getElementById('placeholder-message');
         const MAX_FILE_SIZE_MB = 5; // Set a maximum file size limit for mobile stability
+        const STORAGE_KEY = 'attendanceTrackerState';
 
         // Stores the raw data from the Excel file, used for re-exporting.
         let rawWorksheetData = null;
@@ -140,93 +144,153 @@
         let attendanceState = {};
         let originalSheetName = "Sheet1"; // Default name
 
-        // --- Utility Functions ---
+        // --- Utility Functions for Persistence ---
 
         /**
-         * Safely reads an Excel file using SheetJS (XLSX).
-         * This version is heavily optimized for mobile performance by excluding metadata.
-         * @param {File} file - The uploaded file object.
-         * @returns {Promise<{name: string, data: any}>} - Promise resolving to sheet name and workbook data.
+         * Converts ArrayBuffer to Base64 string for localStorage.
          */
-        const readExcelFile = (file) => {
+        const arrayBufferToBase64 = (buffer) => {
+            let binary = '';
+            const bytes = new Uint8Array(buffer);
+            const len = bytes.byteLength;
+            for (let i = 0; i < len; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary);
+        };
+
+        /**
+         * Converts Base64 string back to ArrayBuffer.
+         */
+        const base64ToArrayBuffer = (base64) => {
+            const binary_string = atob(base64);
+            const len = binary_string.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binary_string.charCodeAt(i);
+            }
+            return bytes.buffer;
+        };
+
+        /**
+         * Core logic to parse the Excel data from an ArrayBuffer.
+         */
+        const processArrayBuffer = (arrayBuffer) => {
+            const data = new Uint8Array(arrayBuffer);
+            
+            // Heavy parsing step - OPTIMIZED for speed on mobile
+            const workbook = XLSX.read(data, { 
+                type: 'array', 
+                cellStyles: false,
+                cellDates: false,
+                cellFormula: false
+            });
+            
+            const sheetName = workbook.SheetNames[0];
+            originalSheetName = sheetName;
+            const worksheet = workbook.Sheets[sheetName];
+
+            // Convert sheet to array of arrays (AOA) format
+            const jsonOptions = { header: 1, raw: false }; 
+            const rawData = XLSX.utils.sheet_to_json(worksheet, jsonOptions);
+
+            const headers = rawData[0];
+            const contentRows = rawData.slice(1);
+
+            return { sheetName, headers, contentRows, workbook };
+        };
+
+        /**
+         * Safely reads an Excel file using FileReader, returning the ArrayBuffer.
+         */
+        const readFileIntoBuffer = (file) => {
             return new Promise((resolve, reject) => {
                 const reader = new FileReader();
                 
-                // 1. Basic file size check before reading
                 if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
                     reject(new Error(`File is too large. Max allowed size is ${MAX_FILE_SIZE_MB}MB. Please reduce the size of your roster.`));
                     return;
                 }
 
-                // Set up event handlers *before* reading the file
                 reader.onload = (e) => {
-                    try {
-                        const data = new Uint8Array(e.target.result);
-                        
-                        // 2. Heavy parsing step - OPTIMIZED for speed on mobile
-                        const workbook = XLSX.read(data, { 
-                            type: 'array', 
-                            cellStyles: false, // EXCLUDE STYLES - HUGE performance gain
-                            cellDates: false,  // EXCLUDE DATES - minor performance gain
-                            cellFormula: false // EXCLUDE FORMULAS - minor performance gain
-                        });
-                        
-                        const sheetName = workbook.SheetNames[0];
-                        originalSheetName = sheetName;
-                        const worksheet = workbook.Sheets[sheetName];
-
-                        // Convert sheet to array of arrays (AOA) format
-                        const jsonOptions = { header: 1, raw: false }; 
-                        const rawData = XLSX.utils.sheet_to_json(worksheet, jsonOptions);
-
-                        // The rawData contains the entire spreadsheet row by row (as arrays)
-                        const headers = rawData[0];
-                        const contentRows = rawData.slice(1);
-
-                        resolve({ sheetName, headers, contentRows, workbook });
-                    } catch (error) {
-                        // 3. Improved error reporting for generic crashes
-                        console.error("SheetJS Parsing Error:", error);
-                        reject(new Error(error.message || "An unknown error occurred during Excel file parsing. The file might be corrupted or too complex. Try saving the file again in a simple .xlsx format."));
-                    }
+                    resolve({ arrayBuffer: e.target.result, fileName: file.name });
                 };
                 
-                // Explicit error handler for the FileReader itself - updated for cloud drive issue
                 reader.onerror = (error) => {
                     console.error("FileReader Disk Error:", error);
-                    // Provide actionable advice for common cloud drive file access issues
-                    reject(new Error("Failed to read file data. This often happens when selecting files directly from cloud drives (like Google Drive). Please download the file to your device first, then try uploading it."));
+                    // Generic error message for file access failures
+                    reject(new Error("File access error. The browser failed to read the file data."));
                 };
 
-                // Start reading the file
                 reader.readAsArrayBuffer(file);
             });
         };
 
         /**
+         * Saves the current application state (file data and attendance) to localStorage.
+         */
+        const saveState = (fileBuffer) => {
+            try {
+                const base64Data = arrayBufferToBase64(fileBuffer);
+                const stateToSave = {
+                    fileData: base64Data,
+                    attendanceState: attendanceState, // Uses current global attendanceState (initially empty when loading new file)
+                    sheetName: originalSheetName,
+                    timestamp: Date.now()
+                };
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
+                console.log("State saved to localStorage.");
+            } catch (e) {
+                console.error("Error saving state to localStorage:", e);
+                // Inform user if quota is reached
+                FILE_STATUS.textContent = "Warning: Could not save attendance state (browser storage quota reached).";
+            }
+        };
+
+        /**
+         * Updates only the attendance state portion in localStorage (on every tap).
+         */
+        const updateAttendanceStateInStorage = () => {
+            try {
+                const existingStateString = localStorage.getItem(STORAGE_KEY);
+                if (existingStateString) {
+                    const existingState = JSON.parse(existingStateString);
+                    existingState.attendanceState = attendanceState;
+                    existingState.timestamp = Date.now();
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(existingState));
+                }
+            } catch (e) {
+                console.error("Error updating attendance state in localStorage:", e);
+            }
+        };
+
+
+        // --- Core Logic Functions ---
+
+        /**
          * Renders the attendance list based on the processed data.
-         * @param {Array<Object>} rows - Array of row data objects.
-         * @param {Array<string>} headers - Array of column headers.
          */
         const renderAttendanceList = (headers, contentRows) => {
-            attendanceState = {};
+            // Only clear state if rendering a NEW file. If loading from storage, attendanceState is already set.
+            if (!rawWorksheetData) {
+                attendanceState = {}; 
+            }
+            
             ATTENDANCE_LIST.innerHTML = '';
             PLACEHOLDER.classList.add('hidden');
             EXPORT_BUTTON.classList.remove('hidden');
             EXPORT_BUTTON.disabled = false;
-            EXPORT_BUTTON.textContent = 'Download Attendance (Export to Excel)'; // Reset button text
+            EXPORT_BUTTON.textContent = 'Download Attendance (Export to Excel)';
 
             /** Helper function to find column index by checking multiple possible header names (case-insensitive) */
             const findColIndex = (headers, names) => {
                 for (const name of names) {
-                    // Check if the header contains any of the required names
                     const index = headers.findIndex(h => h && String(h).trim().toLowerCase().includes(name.toLowerCase()));
                     if (index !== -1) return index;
                 }
                 return -1;
             };
 
-            // Use both English and Hebrew names for finding columns
             const firstNameCol = findColIndex(headers, ['first name', 'שם פרטי']);
             const lastNameCol = findColIndex(headers, ['last name', 'שם משפחה']);
 
@@ -244,28 +308,38 @@
                 const uniqueKey = `row-${index}`;
 
                 if (fullName) {
-                    attendanceState[uniqueKey] = {
-                        rowData: row,
-                        attended: 'Empty', // 'Empty', 'True', 'False'
-                        originalIndex: index + 1 // +1 because we sliced off the header
-                    };
+                    if (!attendanceState[uniqueKey]) {
+                        // Initialize state only if it doesn't exist (i.e., new file upload)
+                        attendanceState[uniqueKey] = {
+                            rowData: row,
+                            attended: 'Empty', // 'Empty', 'True', 'False'
+                            originalIndex: index + 1
+                        };
+                    } else {
+                        // Update rowData in case the file content changed, but preserve attendance status
+                        attendanceState[uniqueKey].rowData = row;
+                    }
 
                     const listItem = document.createElement('div');
                     listItem.id = uniqueKey;
-                    listItem.className = 'name-line state-neutral';
+                    
+                    // Initial class setting is handled by loadState or by the default 'state-neutral' if new file
+                    const initialStatus = attendanceState[uniqueKey].attended;
+                    let initialClass = 'state-neutral';
+                    if (initialStatus === 'True') initialClass = 'state-attended';
+                    if (initialStatus === 'False') initialClass = 'state-absent';
+
+                    listItem.className = `name-line ${initialClass}`;
                     listItem.setAttribute('data-key', uniqueKey);
 
-                    // Green Zone (Tap to mark Present/Attended: True).
                     const greenZone = document.createElement('div');
                     greenZone.className = 'zone green-zone zone-50';
                     greenZone.setAttribute('data-side', 'green');
 
-                    // Red Zone (Tap to mark Absent/Attended: False).
                     const redZone = document.createElement('div');
                     redZone.className = 'zone red-zone zone-50';
                     redZone.setAttribute('data-side', 'red');
 
-                    // Full Name Overlay
                     const nameOverlay = document.createElement('div');
                     nameOverlay.className = 'name-text-overlay';
                     nameOverlay.textContent = fullName;
@@ -274,7 +348,6 @@
                     listItem.appendChild(greenZone);
                     listItem.appendChild(nameOverlay);
 
-                    // Add click/tap listener to the zones
                     greenZone.addEventListener('click', handleAttendanceClick);
                     redZone.addEventListener('click', handleAttendanceClick);
 
@@ -286,10 +359,48 @@
             FILE_STATUS.classList.replace('text-red-600', 'text-gray-500');
         };
 
+        /**
+         * Loads the application state from localStorage on startup.
+         */
+        const loadState = async () => {
+            const stateString = localStorage.getItem(STORAGE_KEY);
+            if (!stateString) {
+                return;
+            }
+
+            FILE_STATUS.textContent = "Loading previous session...";
+            
+            try {
+                const savedState = JSON.parse(stateString);
+                const fileBuffer = base64ToArrayBuffer(savedState.fileData);
+                
+                // Process the raw buffer to reconstruct the workbook data
+                const { headers, contentRows, workbook } = processArrayBuffer(fileBuffer);
+
+                // Restore global state
+                rawWorksheetData = { headers, contentRows, workbook };
+                attendanceState = savedState.attendanceState; // Restore attendance state
+                originalSheetName = savedState.sheetName;
+
+                // Render the list using the restored attendanceState
+                renderAttendanceList(headers, contentRows);
+
+                FILE_STATUS.textContent = `Session loaded from ${new Date(savedState.timestamp).toLocaleTimeString()}. Ready to continue.`;
+                EXPORT_BUTTON.classList.remove('hidden');
+                EXPORT_BUTTON.disabled = false;
+
+
+            } catch (error) {
+                console.error("Error loading state from localStorage:", error);
+                // Clear corrupted state and display error
+                localStorage.removeItem(STORAGE_KEY);
+                FILE_STATUS.textContent = "Previous session corrupted. Please upload a new file.";
+                FILE_STATUS.classList.replace('text-gray-500', 'text-red-600');
+            }
+        };
 
         /**
          * Handles the click/tap event on the red or green zone to update attendance state.
-         * @param {Event} event
          */
         const handleAttendanceClick = (event) => {
             const clickedZone = event.currentTarget;
@@ -306,7 +417,7 @@
                 newState = (currentState === 'False') ? 'Empty' : 'False';
             }
 
-            // Update the state object
+            // Update the state object (Global)
             attendanceState[key].attended = newState;
 
             // Update the visual class
@@ -318,8 +429,10 @@
             } else {
                 listItem.classList.add('state-neutral');
             }
-        };
 
+            // IMPORTANT: Persist attendance changes immediately
+            updateAttendanceStateInStorage();
+        };
 
         /**
          * Creates and downloads the new Excel file with the attendance column.
@@ -333,14 +446,27 @@
             const { headers, contentRows } = rawWorksheetData;
 
             // 1. Identify the column index for the new 'Attended' column.
-            const newHeaders = [...headers, 'Attended'];
-            const attendedColIndex = newHeaders.length - 1;
+            let newHeaders = [...headers];
+            // Check if 'Attended' column already exists in the original headers
+            const existingAttendedIndex = headers.findIndex(h => String(h).toLowerCase() === 'attended');
+            let attendedColIndex;
+
+            if (existingAttendedIndex === -1) {
+                // Add new column if it doesn't exist
+                newHeaders = [...headers, 'Attended'];
+                attendedColIndex = newHeaders.length - 1;
+            } else {
+                // Use existing index if it does
+                attendedColIndex = existingAttendedIndex;
+            }
 
             // 2. Map the attendance state back onto the content rows
             const newContentRows = contentRows.map((row, index) => {
                 const key = `row-${index}`;
                 const state = attendanceState[key];
-                const newRow = [...row];
+                
+                // Ensure the row has enough cells for the new column if added
+                const newRow = existingAttendedIndex === -1 ? [...row, ''] : [...row];
 
                 let attendanceValue = '';
                 if (state) {
@@ -383,9 +509,18 @@
             EXPORT_BUTTON.textContent = 'Processing... Please Wait'; // Show loading feedback
 
             try {
-                const { headers, contentRows, workbook } = await readExcelFile(file);
+                // 1. Read the file into an ArrayBuffer
+                const { arrayBuffer } = await readFileIntoBuffer(file);
+                
+                // 2. Process the ArrayBuffer to get data structure (clears originalSheetName globally)
+                const { headers, contentRows, workbook } = processArrayBuffer(arrayBuffer);
+
+                // 3. Save the raw buffer and current (empty) state to storage immediately (this clears the old session)
                 rawWorksheetData = { headers, contentRows, workbook };
-                renderAttendanceList(headers, contentRows);
+                attendanceState = {}; // Reset attendance state for the new file
+                renderAttendanceList(headers, contentRows); // Rerender list with new empty state
+                saveState(arrayBuffer); // Save new file data and the reset attendance state
+
             } catch (error) {
                 console.error("File processing error:", error);
                 // Display the detailed error message from the try/catch block
@@ -403,15 +538,20 @@
         // Export Button Handler
         EXPORT_BUTTON.addEventListener('click', exportAttendance);
 
-        // Firebase Setup (Required for persistence in this environment, but not used for this client-side app)
+        // --- Firebase/Canvas Boilerplate ---
+        // Note: Using localStorage for persistence per user request.
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
 
         if (firebaseConfig) {
-            console.log("Firebase config loaded. This application uses client-side storage for attendance tracking via JavaScript variables and SheetJS for file operations.");
+            console.log("Firebase config loaded. This application uses client-side localStorage for persistence.");
         } else {
-             console.log("No Firebase config detected. Running in purely client-side mode.");
+             console.log("No Firebase config detected. Running in purely client-side mode with localStorage.");
         }
+
+        // --- Initialization ---
+        // Load the state when the script initializes
+        loadState();
 
     </script>
 </body>
