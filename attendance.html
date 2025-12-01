@@ -92,7 +92,7 @@
     <div class="max-w-md mx-auto">
         <header class="mb-6">
             <h1 class="text-3xl font-extrabold text-gray-900 mb-2">Attendance Check</h1>
-            <p class="text-gray-600">Upload your roster (Excel file) and mark attendance by tapping.</p>
+            <p class="text-gray-600">Upload your roster (Excel file) and mark attendance by tapping. <span class="text-xs text-gray-400">v1.2.0</span></p>
         </header>
 
         <!-- File Input Area -->
@@ -144,6 +144,7 @@
 
         /**
          * Safely reads an Excel file using SheetJS (XLSX).
+         * This version is heavily optimized for mobile performance by excluding metadata.
          * @param {File} file - The uploaded file object.
          * @returns {Promise<{name: string, data: any}>} - Promise resolving to sheet name and workbook data.
          */
@@ -157,12 +158,19 @@
                     return;
                 }
 
+                // Set up event handlers *before* reading the file
                 reader.onload = (e) => {
                     try {
                         const data = new Uint8Array(e.target.result);
                         
-                        // 2. Heavy parsing step - wrap in try/catch for specific error handling
-                        const workbook = XLSX.read(data, { type: 'array' });
+                        // 2. Heavy parsing step - OPTIMIZED for speed on mobile
+                        const workbook = XLSX.read(data, { 
+                            type: 'array', 
+                            cellStyles: false, // EXCLUDE STYLES - HUGE performance gain
+                            cellDates: false,  // EXCLUDE DATES - minor performance gain
+                            cellFormula: false // EXCLUDE FORMULAS - minor performance gain
+                        });
+                        
                         const sheetName = workbook.SheetNames[0];
                         originalSheetName = sheetName;
                         const worksheet = workbook.Sheets[sheetName];
@@ -179,10 +187,17 @@
                     } catch (error) {
                         // 3. Improved error reporting for generic crashes
                         console.error("SheetJS Parsing Error:", error);
-                        reject(new Error(error.message || "An unknown error occurred during Excel file parsing. The file might be corrupted or too complex."));
+                        reject(new Error(error.message || "An unknown error occurred during Excel file parsing. The file might be corrupted or too complex. Try saving the file again in a simple .xlsx format."));
                     }
                 };
-                reader.onerror = (error) => reject(new Error(error.message || "Failed to read file from disk."));
+                
+                // Explicit error handler for the FileReader itself
+                reader.onerror = (error) => {
+                    console.error("FileReader Disk Error:", error);
+                    reject(new Error("Failed to read file from disk. Please try selecting the file again, or try a different file."));
+                };
+
+                // Start reading the file
                 reader.readAsArrayBuffer(file);
             });
         };
@@ -198,6 +213,7 @@
             PLACEHOLDER.classList.add('hidden');
             EXPORT_BUTTON.classList.remove('hidden');
             EXPORT_BUTTON.disabled = false;
+            EXPORT_BUTTON.textContent = 'Download Attendance (Export to Excel)'; // Reset button text
 
             /** Helper function to find column index by checking multiple possible header names (case-insensitive) */
             const findColIndex = (headers, names) => {
@@ -363,6 +379,7 @@
             FILE_STATUS.textContent = `Processing file: ${file.name}...`;
             FILE_STATUS.classList.replace('text-red-600', 'text-gray-500');
             EXPORT_BUTTON.disabled = true;
+            EXPORT_BUTTON.textContent = 'Processing... Please Wait'; // Show loading feedback
 
             try {
                 const { headers, contentRows, workbook } = await readExcelFile(file);
@@ -378,6 +395,7 @@
                 EXPORT_BUTTON.classList.add('hidden');
                 // Clear the input so the user can try again easily
                 FILE_INPUT.value = '';
+                EXPORT_BUTTON.textContent = 'Download Attendance (Export to Excel)'; // Reset button text
             }
         });
 
