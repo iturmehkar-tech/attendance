@@ -92,7 +92,7 @@
     <div class="max-w-md mx-auto">
         <header class="mb-6">
             <h1 class="text-3xl font-extrabold text-gray-900 mb-2">Attendance Check</h1>
-            <p class="text-gray-600">Upload your roster (Excel file) and mark attendance by tapping. <span class="text-xs text-gray-400">v1.2.0</span></p>
+            <p class="text-gray-600">Upload your roster (Excel file) and mark attendance by tapping. <span class="text-xs text-gray-400">v1.2.1</span></p>
         </header>
 
         <!-- File Input Area -->
@@ -191,10 +191,11 @@
                     }
                 };
                 
-                // Explicit error handler for the FileReader itself
+                // Explicit error handler for the FileReader itself - updated for cloud drive issue
                 reader.onerror = (error) => {
                     console.error("FileReader Disk Error:", error);
-                    reject(new Error("Failed to read file from disk. Please try selecting the file again, or try a different file."));
+                    // Provide actionable advice for common cloud drive file access issues
+                    reject(new Error("Failed to read file data. This often happens when selecting files directly from cloud drives (like Google Drive). Please download the file to your device first, then try uploading it."));
                 };
 
                 // Start reading the file
