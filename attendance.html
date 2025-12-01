@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mobile Attendance Tracker</title>
+    <!-- Load Tailwind CSS for mobile-first styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load SheetJS for reading and writing Excel files -->
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+    <style>
+        /* Define Inter font as requested */
+        :root {
+            font-family: 'Inter', sans-serif;
+        }
+
+        /* Base styles for the line item */
+        .name-line {
+            display: flex;
+            height: 64px; /* Sufficient height for touch target */
+            overflow: hidden;
+            border-radius: 0.5rem;
+            margin-bottom: 8px;
+            cursor: pointer;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
+            position: relative;
+        }
+
+        /* Zone common styles */
+        .zone {
+            display: flex;
+            /* Text content is removed, so we only need flex for layout */
+            transition: width 0.3s ease-in-out, background-color 0.3s ease-in-out;
+            user-select: none; /* Prevent text selection on tap */
+        }
+
+        /* Initial state: 50% width */
+        .zone-50 {
+            width: 50%;
+        }
+
+        /* Red Zone - Absent (Lighter Red - Red-300) */
+        .red-zone {
+            background-color: #fca5a5;
+        }
+
+        /* Green Zone - Attended (Lighter Green - Green-300) */
+        .green-zone {
+            background-color: #6ee7b7;
+        }
+
+        /* State: Red is dominant (2/3) */
+        .state-absent .red-zone {
+            width: 66.66%;
+        }
+        .state-absent .green-zone {
+            width: 33.33%;
+        }
+
+        /* State: Green is dominant (2/3) */
+        .state-attended .red-zone {
+            width: 33.33%;
+        }
+        .state-attended .green-zone {
+            width: 66.66%;
+        }
+
+        /* State: Reset/Neutral (50/50) */
+        .state-neutral .red-zone, .state-neutral .green-zone {
+            width: 50%;
+        }
+
+        /* Text overlay for visibility */
+        .name-text-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.125rem; /* text-lg */
+            color: #1f2937; /* Gray-800 */
+            text-shadow: 1px 1px 1px rgba(255, 255, 255, 0.6);
+            pointer-events: none; /* Allows clicks to pass through to the zones */
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen p-4">
+
+    <div class="max-w-md mx-auto">
+        <header class="mb-6">
+            <h1 class="text-3xl font-extrabold text-gray-900 mb-2">Attendance Check</h1>
+            <p class="text-gray-600">Upload your roster (Excel file) and mark attendance by tapping.</p>
+        </header>
+
+        <!-- File Input Area -->
+        <div id="input-section" class="bg-white p-4 rounded-xl shadow-lg mb-6">
+            <input type="file" id="excel-file-input" accept=".xlsx, .xls" class="w-full text-sm text-gray-500
+                file:mr-4 file:py-2 file:px-4
+                file:rounded-lg file:border-0
+                file:text-sm file:font-semibold
+                file:bg-indigo-50 file:text-indigo-700
+                hover:file:bg-indigo-100"
+            />
+            <p id="file-status" class="mt-2 text-sm text-gray-500"></p>
+        </div>
+
+        <!-- Attendance List Area -->
+        <div id="attendance-list" class="space-y-2">
+            <!-- List items will be injected here -->
+            <div id="placeholder-message" class="text-center p-8 bg-white rounded-xl text-gray-500">
+                <svg class="w-10 h-10 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                <p>Upload an Excel file to start tracking attendance.</p>
+            </div>
+        </div>
+
+        <!-- Export Button (Initially hidden) -->
+        <button id="export-button"
+                class="hidden w-full mt-6 py-3 px-4 bg-green-600 hover:bg-green-700 text-white font-bold rounded-xl shadow-lg transition duration-150 ease-in-out active:scale-95 disabled:bg-gray-400"
+                disabled
+        >
+            Download Attendance (Export to Excel)
+        </button>
+    </div>
+
+    <script>
+        // --- Global State and Constants ---
+        const FILE_INPUT = document.getElementById('excel-file-input');
+        const ATTENDANCE_LIST = document.getElementById('attendance-list');
+        const EXPORT_BUTTON = document.getElementById('export-button');
+        const FILE_STATUS = document.getElementById('file-status');
+        const PLACEHOLDER = document.getElementById('placeholder-message');
+
+        // Stores the raw data from the Excel file, used for re-exporting.
+        let rawWorksheetData = null;
+        // Stores the name/attendance state: { uniqueKey: { rowData: {}, attended: 'Empty' | 'True' | 'False' } }
+        let attendanceState = {};
+        let originalSheetName = "Sheet1"; // Default name
+
+        // --- Utility Functions ---
+
+        /**
+         * Safely reads an Excel file using SheetJS (XLSX).
+         * @param {File} file - The uploaded file object.
+         * @returns {Promise<{name: string, data: any}>} - Promise resolving to sheet name and workbook data.
+         */
+        const readExcelFile = (file) => {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const data = new Uint8Array(e.target.result);
+                        const workbook = XLSX.read(data, { type: 'array' });
+                        const sheetName = workbook.SheetNames[0];
+                        originalSheetName = sheetName;
+                        const worksheet = workbook.Sheets[sheetName];
+
+                        // Convert sheet to array of objects (JSON format)
+                        const jsonOptions = { header: 1, raw: false }; // Use 1 for header row as array index
+                        const rawData = XLSX.utils.sheet_to_json(worksheet, jsonOptions);
+
+                        // The rawData contains the entire spreadsheet row by row (as arrays)
+                        // We also get the header row separately for column mapping.
+                        const headers = rawData[0];
+                        const contentRows = rawData.slice(1);
+
+                        resolve({ sheetName, headers, contentRows, workbook });
+                    } catch (error) {
+                        reject(error);
+                    }
+                };
+                reader.onerror = (error) => reject(error);
+                reader.readAsArrayBuffer(file);
+            });
+        };
+
+        /**
+         * Renders the attendance list based on the processed data.
+         * @param {Array<Object>} rows - Array of row data objects.
+         * @param {Array<string>} headers - Array of column headers.
+         */
+        const renderAttendanceList = (headers, contentRows) => {
+            attendanceState = {};
+            ATTENDANCE_LIST.innerHTML = '';
+            PLACEHOLDER.classList.add('hidden');
+            EXPORT_BUTTON.classList.remove('hidden');
+            EXPORT_BUTTON.disabled = false;
+
+            /** Helper function to find column index by checking multiple possible header names (case-insensitive) */
+            const findColIndex = (headers, names) => {
+                for (const name of names) {
+                    const index = headers.findIndex(h => h && String(h).toLowerCase().includes(name.toLowerCase()));
+                    if (index !== -1) return index;
+                }
+                return -1;
+            };
+
+            // Use both English and Hebrew names for finding columns
+            const firstNameCol = findColIndex(headers, ['first name', 'שם פרטי']);
+            const lastNameCol = findColIndex(headers, ['last name', 'שם משפחה']);
+
+            if (firstNameCol === -1 || lastNameCol === -1) {
+                FILE_STATUS.textContent = "Error: Could not find columns for 'First Name' or 'Last Name' ('שם פרטי' or 'שם משפחה').";
+                FILE_STATUS.classList.replace('text-gray-500', 'text-red-600');
+                EXPORT_BUTTON.disabled = true;
+                return;
+            }
+
+            contentRows.forEach((row, index) => {
+                const firstName = row[firstNameCol] || '';
+                const lastName = row[lastNameCol] || '';
+                const fullName = `${firstName} ${lastName}`.trim();
+                const uniqueKey = `row-${index}`;
+
+                if (fullName) {
+                    attendanceState[uniqueKey] = {
+                        rowData: row,
+                        attended: 'Empty', // 'Empty', 'True', 'False'
+                        originalIndex: index + 1 // +1 because we sliced off the header
+                    };
+
+                    const listItem = document.createElement('div');
+                    listItem.id = uniqueKey;
+                    listItem.className = 'name-line state-neutral';
+                    listItem.setAttribute('data-key', uniqueKey);
+
+                    // Green Zone (Tap to mark Present/Attended: True). Text content removed.
+                    const greenZone = document.createElement('div');
+                    greenZone.className = 'zone green-zone zone-50';
+                    greenZone.setAttribute('data-side', 'green');
+                    // greenZone.innerHTML = 'PRESENT'; <-- Removed
+
+                    // Red Zone (Tap to mark Absent/Attended: False). Text content removed.
+                    const redZone = document.createElement('div');
+                    redZone.className = 'zone red-zone zone-50';
+                    redZone.setAttribute('data-side', 'red');
+                    // redZone.innerHTML = 'ABSENT'; <-- Removed
+
+                    // Full Name Overlay
+                    const nameOverlay = document.createElement('div');
+                    nameOverlay.className = 'name-text-overlay';
+                    nameOverlay.textContent = fullName;
+
+                    listItem.appendChild(redZone);
+                    listItem.appendChild(greenZone);
+                    listItem.appendChild(nameOverlay);
+
+                    // Add click/tap listener to the zones
+                    greenZone.addEventListener('click', handleAttendanceClick);
+                    redZone.addEventListener('click', handleAttendanceClick);
+
+                    ATTENDANCE_LIST.appendChild(listItem);
+                }
+            });
+
+            FILE_STATUS.textContent = `Successfully loaded ${contentRows.length} rows from sheet "${originalSheetName}".`;
+            FILE_STATUS.classList.replace('text-red-600', 'text-gray-500');
+        };
+
+
+        /**
+         * Handles the click/tap event on the red or green zone to update attendance state.
+         * @param {Event} event
+         */
+        const handleAttendanceClick = (event) => {
+            const clickedZone = event.currentTarget;
+            const side = clickedZone.getAttribute('data-side'); // 'red' or 'green'
+            const listItem = clickedZone.closest('.name-line');
+            const key = listItem.getAttribute('data-key');
+
+            const currentState = attendanceState[key].attended;
+            let newState;
+
+            if (side === 'green') {
+                newState = (currentState === 'True') ? 'Empty' : 'True';
+            } else { // side === 'red'
+                newState = (currentState === 'False') ? 'Empty' : 'False';
+            }
+
+            // Update the state object
+            attendanceState[key].attended = newState;
+
+            // Update the visual class
+            listItem.classList.remove('state-neutral', 'state-attended', 'state-absent');
+            if (newState === 'True') {
+                listItem.classList.add('state-attended');
+            } else if (newState === 'False') {
+                listItem.classList.add('state-absent');
+            } else {
+                listItem.classList.add('state-neutral');
+            }
+        };
+
+
+        /**
+         * Creates and downloads the new Excel file with the attendance column.
+         */
+        const exportAttendance = () => {
+            if (!rawWorksheetData || Object.keys(attendanceState).length === 0) {
+                console.error("No data to export.");
+                return;
+            }
+
+            const { headers, contentRows } = rawWorksheetData;
+
+            // 1. Identify the column index for the new 'Attended' column.
+            const newHeaders = [...headers, 'Attended'];
+            const attendedColIndex = newHeaders.length - 1;
+
+            // 2. Map the attendance state back onto the content rows
+            const newContentRows = contentRows.map((row, index) => {
+                const key = `row-${index}`;
+                const state = attendanceState[key];
+                const newRow = [...row];
+
+                let attendanceValue = '';
+                if (state) {
+                    if (state.attended === 'True') {
+                        attendanceValue = 'TRUE';
+                    } else if (state.attended === 'False') {
+                        attendanceValue = 'FALSE';
+                    }
+                }
+                newRow[attendedColIndex] = attendanceValue;
+                return newRow;
+            });
+
+            // 3. Combine headers and new content
+            const exportData = [newHeaders, ...newContentRows];
+
+            // 4. Create the new workbook and sheet
+            const ws = XLSX.utils.aoa_to_sheet(exportData);
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, originalSheetName);
+
+            // 5. Trigger download
+            const fileName = originalSheetName.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+            XLSX.writeFile(wb, `${fileName}_attendance_${new Date().toISOString().slice(0, 10)}.xlsx`);
+        };
+
+
+        // --- Event Listeners and Initialization ---
+
+        // File Input Change Handler
+        FILE_INPUT.addEventListener('change', async (event) => {
+            const file = event.target.files[0];
+            if (!file) {
+                return;
+            }
+
+            FILE_STATUS.textContent = `Processing file: ${file.name}...`;
+            FILE_STATUS.classList.replace('text-red-600', 'text-gray-500');
+            EXPORT_BUTTON.disabled = true;
+
+            try {
+                const { headers, contentRows, workbook } = await readExcelFile(file);
+                rawWorksheetData = { headers, contentRows, workbook };
+                renderAttendanceList(headers, contentRows);
+            } catch (error) {
+                console.error("File processing error:", error);
+                FILE_STATUS.textContent = `Failed to process file. Check console for details. Error: ${error.message}`;
+                FILE_STATUS.classList.replace('text-gray-500', 'text-red-600');
+                ATTENDANCE_LIST.innerHTML = '';
+                PLACEHOLDER.classList.remove('hidden');
+                EXPORT_BUTTON.classList.add('hidden');
+            }
+        });
+
+        // Export Button Handler
+        EXPORT_BUTTON.addEventListener('click', exportAttendance);
+
+        // Firebase Setup (Required for persistence in this environment, but not used for this client-side app)
+        // Note: For a purely client-side app that doesn't persist data between sessions,
+        // this section is technically unused, but is kept for platform compliance.
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+
+        if (firebaseConfig) {
+            console.log("Firebase config loaded. This application uses client-side storage for attendance tracking via JavaScript variables and SheetJS for file operations.");
+        } else {
+             console.log("No Firebase config detected. Running in purely client-side mode.");
+        }
+
+    </script>
+</body>
+</html>
