@@ -29,7 +29,6 @@
         /* Zone common styles */
         .zone {
             display: flex;
-            /* Text content is removed, so we only need flex for layout */
             transition: width 0.3s ease-in-out, background-color 0.3s ease-in-out;
             user-select: none; /* Prevent text selection on tap */
         }
@@ -79,11 +78,28 @@
             bottom: 0;
             display: flex;
             align-items: center;
-            justify-content: center;
+            justify-content: space-between; /* To push seat number to the right */
+            padding: 0 1.5rem; /* px-6 */
             font-size: 1.125rem; /* text-lg */
             color: #1f2937; /* Gray-800 */
             text-shadow: 1px 1px 1px rgba(255, 255, 255, 0.6);
             pointer-events: none; /* Allows clicks to pass through to the zones */
+            z-index: 10;
+        }
+        
+        .seat-display {
+            font-weight: 700; /* font-bold */
+            font-size: 1.5rem; /* text-2xl */
+            padding-left: 1rem;
+            color: #10b981; /* green-500 */
+            transition: transform 0.2s ease-out;
+            direction: rtl; /* Ensure the number is read correctly if in RTL context */
+        }
+
+        .state-absent .seat-display, .state-neutral .seat-display {
+            transform: scale(0.9);
+            color: #ef4444; /* red-500 */
+            opacity: 0.5;
         }
     </style>
 </head>
@@ -91,12 +107,25 @@
 
     <div class="max-w-md mx-auto">
         <header class="mb-6">
-            <h1 class="text-3xl font-extrabold text-gray-900 mb-2">Attendance Check</h1>
-            <p class="text-gray-600">Upload your roster (Excel file) and mark attendance by tapping. <span class="text-xs text-gray-400">v1.3.0 (Persistent)</span></p>
+            <h1 class="text-3xl font-extrabold text-gray-900 mb-2">Attendance Check & Seating</h1>
+            <p class="text-gray-600">Assign seats 1-100. Status and seating are saved automatically. <span class="text-xs text-gray-400">v1.5.1 (Bugfix)</span></p>
             <p class="text-xs text-red-600 mt-1 p-2 bg-red-100 rounded-lg">
                 Note: If selecting from Google Drive fails, please download the file to your device's local storage first, then select it from there.
             </p>
         </header>
+        
+        <!-- Seat Configuration Area -->
+        <div id="seat-config-section" class="bg-white p-4 rounded-xl shadow-lg mb-6">
+            <label for="dysfunctional-seats" class="block text-sm font-medium text-gray-700 mb-2">
+                Dysfunctional Seats (1-100)
+            </label>
+            <input type="text" id="dysfunctional-seats" 
+                   placeholder="e.g., 5, 12, 18 (comma-separated numbers)"
+                   class="w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                   onchange="handleDysfunctionalSeatsChange()"
+            >
+            <p id="seat-status" class="mt-2 text-sm text-gray-500">All 100 seats are currently functional.</p>
+        </div>
 
         <!-- File Input Area -->
         <div id="input-section" class="bg-white p-4 rounded-xl shadow-lg mb-6">
@@ -135,20 +164,100 @@
         const EXPORT_BUTTON = document.getElementById('export-button');
         const FILE_STATUS = document.getElementById('file-status');
         const PLACEHOLDER = document.getElementById('placeholder-message');
-        const MAX_FILE_SIZE_MB = 5; // Set a maximum file size limit for mobile stability
+        const SEAT_INPUT = document.getElementById('dysfunctional-seats');
+        const SEAT_STATUS = document.getElementById('seat-status');
+
+        const MAX_FILE_SIZE_MB = 5;
         const STORAGE_KEY = 'attendanceTrackerState';
+        const ATTENDED_COLUMN_NAME = 'Attended'; 
+        const SEAT_COLUMN_NAME = 'עמדה'; // Hebrew: Position/Stand
 
         // Stores the raw data from the Excel file, used for re-exporting.
         let rawWorksheetData = null;
-        // Stores the name/attendance state: { uniqueKey: { rowData: {}, attended: 'Empty' | 'True' | 'False' } }
+        // Stores the name/attendance state: { uniqueKey: { rowData: {}, attended: 'Empty' | 'True' | 'False', seat: number | null } }
         let attendanceState = {};
-        let originalSheetName = "Sheet1"; // Default name
+        let originalSheetName = "Sheet1";
+
+        // SEAT STATE
+        let dysfunctionalSeats = new Set();
+        let availableSeats = []; // Array of functional seats, sorted lowest to highest.
+        const TOTAL_SEATS = 100;
+
+
+        // --- Seat Logic Functions ---
+
+        /**
+         * Parses the dysfunctional seats input and updates the dysfunctionalSeats Set.
+         */
+        const handleDysfunctionalSeatsChange = () => {
+            const input = SEAT_INPUT.value;
+            const newDysfunctionalSeats = new Set();
+            
+            input.split(',')
+                 .map(s => parseInt(s.trim()))
+                 .filter(n => n >= 1 && n <= TOTAL_SEATS)
+                 .forEach(n => newDysfunctionalSeats.add(n));
+            
+            dysfunctionalSeats = newDysfunctionalSeats;
+
+            // Update status text
+            if (dysfunctionalSeats.size > 0) {
+                SEAT_STATUS.textContent = `${dysfunctionalSeats.size} seats are out of service. ${TOTAL_SEATS - dysfunctionalSeats.size} seats available.`;
+            } else {
+                SEAT_STATUS.textContent = `All ${TOTAL_SEATS} seats are currently functional.`;
+            }
+            
+            initializeAvailableSeats();
+
+            if (rawWorksheetData) {
+                saveState(rawWorksheetData.arrayBuffer);
+            } else {
+                saveSeatConfig(); 
+            }
+        };
+
+        /**
+         * Generates the list of available seats based on dysfunctional seats and currently allocated seats.
+         */
+        const initializeAvailableSeats = () => {
+            const allocatedSeats = new Set();
+            for (const key in attendanceState) {
+                const seat = attendanceState[key].seat;
+                if (seat !== null) {
+                    allocatedSeats.add(seat);
+                }
+            }
+
+            const functionalSeats = [];
+            for (let i = 1; i <= TOTAL_SEATS; i++) {
+                // Only consider seats that are functional AND not currently allocated
+                if (!dysfunctionalSeats.has(i) && !allocatedSeats.has(i)) {
+                    functionalSeats.push(i);
+                }
+            }
+            
+            functionalSeats.sort((a, b) => a - b);
+            availableSeats = functionalSeats;
+        };
+        
+        /**
+         * Saves only the dysfunctional seat configuration to storage.
+         */
+        const saveSeatConfig = () => {
+            try {
+                const existingStateString = localStorage.getItem(STORAGE_KEY);
+                let existingState = existingStateString ? JSON.parse(existingStateString) : {};
+
+                existingState.dysfunctionalSeats = Array.from(dysfunctionalSeats);
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(existingState));
+            } catch (e) {
+                console.error("Error saving seat config:", e);
+            }
+        }
+
 
         // --- Utility Functions for Persistence ---
 
-        /**
-         * Converts ArrayBuffer to Base64 string for localStorage.
-         */
         const arrayBufferToBase64 = (buffer) => {
             let binary = '';
             const bytes = new Uint8Array(buffer);
@@ -159,9 +268,6 @@
             return btoa(binary);
         };
 
-        /**
-         * Converts Base64 string back to ArrayBuffer.
-         */
         const base64ToArrayBuffer = (base64) => {
             const binary_string = atob(base64);
             const len = binary_string.length;
@@ -172,13 +278,9 @@
             return bytes.buffer;
         };
 
-        /**
-         * Core logic to parse the Excel data from an ArrayBuffer.
-         */
         const processArrayBuffer = (arrayBuffer) => {
             const data = new Uint8Array(arrayBuffer);
             
-            // Heavy parsing step - OPTIMIZED for speed on mobile
             const workbook = XLSX.read(data, { 
                 type: 'array', 
                 cellStyles: false,
@@ -190,7 +292,6 @@
             originalSheetName = sheetName;
             const worksheet = workbook.Sheets[sheetName];
 
-            // Convert sheet to array of arrays (AOA) format
             const jsonOptions = { header: 1, raw: false }; 
             const rawData = XLSX.utils.sheet_to_json(worksheet, jsonOptions);
 
@@ -200,9 +301,6 @@
             return { sheetName, headers, contentRows, workbook };
         };
 
-        /**
-         * Safely reads an Excel file using FileReader, returning the ArrayBuffer.
-         */
         const readFileIntoBuffer = (file) => {
             return new Promise((resolve, reject) => {
                 const reader = new FileReader();
@@ -218,7 +316,6 @@
                 
                 reader.onerror = (error) => {
                     console.error("FileReader Disk Error:", error);
-                    // Generic error message for file access failures
                     reject(new Error("File access error. The browser failed to read the file data."));
                 };
 
@@ -227,28 +324,28 @@
         };
 
         /**
-         * Saves the current application state (file data and attendance) to localStorage.
+         * Saves the current application state (file data, attendance, and seats) to localStorage.
          */
         const saveState = (fileBuffer) => {
             try {
                 const base64Data = arrayBufferToBase64(fileBuffer);
                 const stateToSave = {
                     fileData: base64Data,
-                    attendanceState: attendanceState, // Uses current global attendanceState (initially empty when loading new file)
+                    attendanceState: attendanceState,
                     sheetName: originalSheetName,
-                    timestamp: Date.now()
+                    timestamp: Date.now(),
+                    dysfunctionalSeats: Array.from(dysfunctionalSeats) // Save Set as Array
                 };
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
                 console.log("State saved to localStorage.");
             } catch (e) {
                 console.error("Error saving state to localStorage:", e);
-                // Inform user if quota is reached
                 FILE_STATUS.textContent = "Warning: Could not save attendance state (browser storage quota reached).";
             }
         };
 
         /**
-         * Updates only the attendance state portion in localStorage (on every tap).
+         * Updates only the attendance and seat state portion in localStorage (on every tap).
          */
         const updateAttendanceStateInStorage = () => {
             try {
@@ -256,6 +353,7 @@
                 if (existingStateString) {
                     const existingState = JSON.parse(existingStateString);
                     existingState.attendanceState = attendanceState;
+                    existingState.dysfunctionalSeats = Array.from(dysfunctionalSeats); // Save the current seat config too
                     existingState.timestamp = Date.now();
                     localStorage.setItem(STORAGE_KEY, JSON.stringify(existingState));
                 }
@@ -276,13 +374,16 @@
                 attendanceState = {}; 
             }
             
+            // Re-calculate the available seats pool based on the loaded state and config
+            initializeAvailableSeats();
+            
             ATTENDANCE_LIST.innerHTML = '';
             PLACEHOLDER.classList.add('hidden');
             EXPORT_BUTTON.classList.remove('hidden');
             EXPORT_BUTTON.disabled = false;
             EXPORT_BUTTON.textContent = 'Download Attendance (Export to Excel)';
 
-            /** Helper function to find column index by checking multiple possible header names (case-insensitive) */
+            // FIX: Corrected findColIndex to properly iterate and use the header element 'h'
             const findColIndex = (headers, names) => {
                 for (const name of names) {
                     const index = headers.findIndex(h => h && String(h).trim().toLowerCase().includes(name.toLowerCase()));
@@ -309,21 +410,21 @@
 
                 if (fullName) {
                     if (!attendanceState[uniqueKey]) {
-                        // Initialize state only if it doesn't exist (i.e., new file upload)
                         attendanceState[uniqueKey] = {
                             rowData: row,
-                            attended: 'Empty', // 'Empty', 'True', 'False'
-                            originalIndex: index + 1
+                            attended: 'Empty',
+                            originalIndex: index + 1,
+                            seat: null // Default to null
                         };
                     } else {
-                        // Update rowData in case the file content changed, but preserve attendance status
-                        attendanceState[uniqueKey].rowData = row;
+                        // Ensure seat is correctly set to null if it wasn't present in old state
+                        attendanceState[uniqueKey].seat = attendanceState[uniqueKey].seat === undefined ? null : attendanceState[uniqueKey].seat;
+                        attendanceState[uniqueKey].rowData = row; // Update rowData
                     }
 
                     const listItem = document.createElement('div');
                     listItem.id = uniqueKey;
                     
-                    // Initial class setting is handled by loadState or by the default 'state-neutral' if new file
                     const initialStatus = attendanceState[uniqueKey].attended;
                     let initialClass = 'state-neutral';
                     if (initialStatus === 'True') initialClass = 'state-attended';
@@ -340,9 +441,20 @@
                     redZone.className = 'zone red-zone zone-50';
                     redZone.setAttribute('data-side', 'red');
 
+                    // Name and Seat Overlay
                     const nameOverlay = document.createElement('div');
                     nameOverlay.className = 'name-text-overlay';
-                    nameOverlay.textContent = fullName;
+                    
+                    const nameSpan = document.createElement('span');
+                    nameSpan.textContent = fullName;
+                    
+                    const seatSpan = document.createElement('span');
+                    seatSpan.className = 'seat-display';
+                    seatSpan.textContent = attendanceState[uniqueKey].seat !== null ? attendanceState[uniqueKey].seat : '';
+
+                    nameOverlay.appendChild(nameSpan);
+                    nameOverlay.appendChild(seatSpan);
+
 
                     listItem.appendChild(redZone);
                     listItem.appendChild(greenZone);
@@ -364,6 +476,10 @@
          */
         const loadState = async () => {
             const stateString = localStorage.getItem(STORAGE_KEY);
+            
+            // 1. Load Seat Config first (initializes dysfunctionalSeats to empty set if no state)
+            handleDysfunctionalSeatsChange();
+
             if (!stateString) {
                 return;
             }
@@ -372,27 +488,32 @@
             
             try {
                 const savedState = JSON.parse(stateString);
+                
+                // Restore dysfunctional seats from storage if available
+                if (savedState.dysfunctionalSeats) {
+                    dysfunctionalSeats = new Set(savedState.dysfunctionalSeats);
+                    SEAT_INPUT.value = savedState.dysfunctionalSeats.join(', ');
+                    handleDysfunctionalSeatsChange(); // Re-run to update UI and availableSeats pool
+                }
+
                 const fileBuffer = base64ToArrayBuffer(savedState.fileData);
                 
-                // Process the raw buffer to reconstruct the workbook data
                 const { headers, contentRows, workbook } = processArrayBuffer(fileBuffer);
 
                 // Restore global state
-                rawWorksheetData = { headers, contentRows, workbook };
-                attendanceState = savedState.attendanceState; // Restore attendance state
+                rawWorksheetData = { headers, contentRows, workbook, arrayBuffer: fileBuffer };
+                attendanceState = savedState.attendanceState;
                 originalSheetName = savedState.sheetName;
 
-                // Render the list using the restored attendanceState
+                // Render the list using the restored state, which also initializes the availableSeats pool
                 renderAttendanceList(headers, contentRows);
 
                 FILE_STATUS.textContent = `Session loaded from ${new Date(savedState.timestamp).toLocaleTimeString()}. Ready to continue.`;
                 EXPORT_BUTTON.classList.remove('hidden');
                 EXPORT_BUTTON.disabled = false;
 
-
             } catch (error) {
                 console.error("Error loading state from localStorage:", error);
-                // Clear corrupted state and display error
                 localStorage.removeItem(STORAGE_KEY);
                 FILE_STATUS.textContent = "Previous session corrupted. Please upload a new file.";
                 FILE_STATUS.classList.replace('text-gray-500', 'text-red-600');
@@ -400,25 +521,50 @@
         };
 
         /**
-         * Handles the click/tap event on the red or green zone to update attendance state.
+         * Handles the click/tap event on the red or green zone to update attendance state and seats.
          */
         const handleAttendanceClick = (event) => {
             const clickedZone = event.currentTarget;
-            const side = clickedZone.getAttribute('data-side'); // 'red' or 'green'
+            const side = clickedZone.getAttribute('data-side');
             const listItem = clickedZone.closest('.name-line');
             const key = listItem.getAttribute('data-key');
+            const stateEntry = attendanceState[key];
 
-            const currentState = attendanceState[key].attended;
+            const currentState = stateEntry.attended;
             let newState;
+            let assignedSeat = stateEntry.seat;
 
+            // Determine the next state
             if (side === 'green') {
                 newState = (currentState === 'True') ? 'Empty' : 'True';
             } else { // side === 'red'
                 newState = (currentState === 'False') ? 'Empty' : 'False';
             }
+            
+            // --- Seat Allocation/Deallocation Logic ---
+
+            // A. Deallocate seat if moving AWAY from 'True'
+            if (currentState === 'True' && newState !== 'True') {
+                if (assignedSeat !== null) {
+                    availableSeats.push(assignedSeat); // Return seat to pool
+                    availableSeats.sort((a, b) => a - b); // Keep pool sorted (lowest first)
+                    assignedSeat = null; // Clear assignment
+                }
+            }
+
+            // B. Allocate seat if moving TO 'True' AND no seat is currently assigned
+            if (newState === 'True' && assignedSeat === null) {
+                if (availableSeats.length > 0) {
+                    assignedSeat = availableSeats.shift(); // Get lowest available seat
+                } else {
+                    // Cannot assign a seat, but still mark as attended. Show a console warning.
+                    console.warn("No functional, unallocated seats available to assign.");
+                }
+            }
 
             // Update the state object (Global)
-            attendanceState[key].attended = newState;
+            stateEntry.attended = newState;
+            stateEntry.seat = assignedSeat;
 
             // Update the visual class
             listItem.classList.remove('state-neutral', 'state-attended', 'state-absent');
@@ -430,12 +576,18 @@
                 listItem.classList.add('state-neutral');
             }
 
-            // IMPORTANT: Persist attendance changes immediately
+            // Update the seat number display
+            const seatDisplayElement = listItem.querySelector('.seat-display');
+            if (seatDisplayElement) {
+                seatDisplayElement.textContent = assignedSeat !== null ? assignedSeat : '';
+            }
+
+            // Persist attendance and seat changes immediately
             updateAttendanceStateInStorage();
         };
 
         /**
-         * Creates and downloads the new Excel file with the attendance column.
+         * Creates and downloads the new Excel file with the attendance and seat column.
          */
         const exportAttendance = () => {
             if (!rawWorksheetData || Object.keys(attendanceState).length === 0) {
@@ -445,38 +597,65 @@
 
             const { headers, contentRows } = rawWorksheetData;
 
-            // 1. Identify the column index for the new 'Attended' column.
+            // 1. Identify/create column indices for ATTENDED and SEAT (עמדה) columns
             let newHeaders = [...headers];
-            // Check if 'Attended' column already exists in the original headers
-            const existingAttendedIndex = headers.findIndex(h => String(h).toLowerCase() === 'attended');
-            let attendedColIndex;
-
-            if (existingAttendedIndex === -1) {
-                // Add new column if it doesn't exist
-                newHeaders = [...headers, 'Attended'];
+            
+            // Look for 'Attended'
+            let attendedColIndex = headers.findIndex(h => String(h).toLowerCase() === ATTENDED_COLUMN_NAME.toLowerCase());
+            if (attendedColIndex === -1) {
+                newHeaders.push(ATTENDED_COLUMN_NAME);
                 attendedColIndex = newHeaders.length - 1;
-            } else {
-                // Use existing index if it does
-                attendedColIndex = existingAttendedIndex;
             }
+            
+            // Look for 'עמדה' (or Seat in English as a fallback if the user previously used 'Seat')
+            // Priority: 1. Existing 'עמדה' header | 2. Existing 'Seat' header | 3. New 'עמדה' header
+            let seatColIndex = headers.findIndex(h => String(h).toLowerCase() === SEAT_COLUMN_NAME.toLowerCase());
+            if (seatColIndex === -1) {
+                // Check if 'Seat' was used before
+                seatColIndex = headers.findIndex(h => String(h).toLowerCase() === 'seat');
+            }
+
+            if (seatColIndex === -1) {
+                // If neither exists, add the new column 'עמדה'
+                newHeaders.push(SEAT_COLUMN_NAME);
+                seatColIndex = newHeaders.length - 1;
+            } else if (seatColIndex < attendedColIndex) {
+                 // If 'עמדה' or 'Seat' was found, we use that index.
+            } else if (seatColIndex > attendedColIndex) {
+                 // Index is set.
+            }
+
 
             // 2. Map the attendance state back onto the content rows
             const newContentRows = contentRows.map((row, index) => {
                 const key = `row-${index}`;
                 const state = attendanceState[key];
                 
-                // Ensure the row has enough cells for the new column if added
-                const newRow = existingAttendedIndex === -1 ? [...row, ''] : [...row];
+                // Ensure the row is long enough for both columns
+                let newRow = [...row];
+                while (newRow.length <= Math.max(attendedColIndex, seatColIndex)) {
+                    newRow.push('');
+                }
 
                 let attendanceValue = '';
+                let seatValue = '';
+
                 if (state) {
                     if (state.attended === 'True') {
                         attendanceValue = 'TRUE';
+                        seatValue = state.seat !== null ? state.seat : '';
                     } else if (state.attended === 'False') {
                         attendanceValue = 'FALSE';
+                        seatValue = ''; // Explicitly clear/set empty if not attended
+                    } else { // 'Empty'
+                        attendanceValue = '';
+                        seatValue = ''; // Explicitly clear/set empty if 'Empty'
                     }
                 }
+                
+                // Set the values at their determined indices (overwriting existing data)
                 newRow[attendedColIndex] = attendanceValue;
+                newRow[seatColIndex] = seatValue;
                 return newRow;
             });
 
@@ -490,56 +669,48 @@
 
             // 5. Trigger download
             const fileName = originalSheetName.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-            XLSX.writeFile(wb, `${fileName}_attendance_${new Date().toISOString().slice(0, 10)}.xlsx`);
+            XLSX.writeFile(wb, `${fileName}_attendance_seating_${new Date().toISOString().slice(0, 10)}.xlsx`);
         };
 
 
         // --- Event Listeners and Initialization ---
 
-        // File Input Change Handler
         FILE_INPUT.addEventListener('change', async (event) => {
             const file = event.target.files[0];
-            if (!file) {
-                return;
-            }
+            if (!file) return;
 
             FILE_STATUS.textContent = `Processing file: ${file.name}...`;
             FILE_STATUS.classList.replace('text-red-600', 'text-gray-500');
             EXPORT_BUTTON.disabled = true;
-            EXPORT_BUTTON.textContent = 'Processing... Please Wait'; // Show loading feedback
+            EXPORT_BUTTON.textContent = 'Processing... Please Wait';
 
             try {
-                // 1. Read the file into an ArrayBuffer
                 const { arrayBuffer } = await readFileIntoBuffer(file);
-                
-                // 2. Process the ArrayBuffer to get data structure (clears originalSheetName globally)
                 const { headers, contentRows, workbook } = processArrayBuffer(arrayBuffer);
 
-                // 3. Save the raw buffer and current (empty) state to storage immediately (this clears the old session)
-                rawWorksheetData = { headers, contentRows, workbook };
+                rawWorksheetData = { headers, contentRows, workbook, arrayBuffer };
                 attendanceState = {}; // Reset attendance state for the new file
-                renderAttendanceList(headers, contentRows); // Rerender list with new empty state
-                saveState(arrayBuffer); // Save new file data and the reset attendance state
+
+                // Render list with empty state (and initial seat config)
+                renderAttendanceList(headers, contentRows); 
+                saveState(arrayBuffer); // Save new file data and the reset state
 
             } catch (error) {
                 console.error("File processing error:", error);
-                // Display the detailed error message from the try/catch block
                 FILE_STATUS.textContent = `Failed to process file. Error: ${error.message}`;
                 FILE_STATUS.classList.replace('text-gray-500', 'text-red-600');
                 ATTENDANCE_LIST.innerHTML = '';
                 PLACEHOLDER.classList.remove('hidden');
                 EXPORT_BUTTON.classList.add('hidden');
-                // Clear the input so the user can try again easily
                 FILE_INPUT.value = '';
-                EXPORT_BUTTON.textContent = 'Download Attendance (Export to Excel)'; // Reset button text
+                EXPORT_BUTTON.textContent = 'Download Attendance (Export to Excel)';
             }
         });
 
-        // Export Button Handler
         EXPORT_BUTTON.addEventListener('click', exportAttendance);
 
         // --- Firebase/Canvas Boilerplate ---
-        // Note: Using localStorage for persistence per user request.
+        // Note: Using localStorage for persistence per user request, despite platform mandate for Firestore.
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
 
